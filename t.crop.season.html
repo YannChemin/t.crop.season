@@ -1,0 +1,229 @@
+<h2>DESCRIPTION</h2>
+
+<p>A <a href="https://grass.osgeo.org/">GRASS GIS</a> addon that derives <strong>crop
+development stage</strong> and <strong>irrigation status</strong> from fused Sentinel-1 SAR
+and Sentinel-2 optical time series (Space-Time Raster Datasets, STRDS)
+over a user-defined period of interest.</p>
+<pre><code>t.crop.season red=s2_B04 nir=s2_B08 swir=s2_B11 \
+              vv=s1_VV vh=s1_VH \
+              start=2023-03-01 end=2023-10-01 \
+              output=field2023</code></pre>
+<p>It is designed to sit downstream of
+<a href="https://github.com/YannChemin/r.in.sentinel">r.in.sentinel</a>, which
+imports Sentinel-1/2 scenes and can register them directly as
+per-band STRDS (<code>strds=</code> option) with the naming this module expects.</p>
+<h2 id="why">Why</h2>
+<p>Individually, optical and SAR time series each carry partial
+information about a crop’s growth: NDVI tracks chlorophyll/canopy
+cover but is blind on cloudy days; VV/VH backscatter is
+cloud-independent and structurally sensitive but noisier and
+confounded by soil moisture. Fusing both, as demonstrated across a
+body of recent remote-sensing literature (see <a href="#references">References</a>),
+gives more complete phenology timing and opens the door to detecting
+irrigation events from the SAR soil-moisture signal that optical data
+cannot see. <code>t.crop.season</code> implements that fusion as a single GRASS
+temporal-framework tool.</p>
+<h2 id="what-it-computes">What it computes</h2>
+<h3 id="indices-per-acquisition-date">1. Indices (per acquisition date)</h3>
+<ul>
+<li><strong>NDVI</strong> = (NIR − Red) / (NIR + Red)</li>
+<li><strong>NDWI</strong> = (NIR − SWIR) / (NIR + SWIR) (Gao 1996 formulation)</li>
+<li><strong>CR</strong> (SAR cross-ratio) = VH − VV, in dB</li>
+</ul>
+<p>Each is registered as its own output STRDS (<code>&lt;output&gt;_ndvi</code>,
+<code>&lt;output&gt;_ndwi</code>, <code>&lt;output&gt;_cr</code>).</p>
+<h3 id="phenology-per-pixel-over-the-whole-period">2. Phenology (per pixel, over the whole period)</h3>
+<p>By default, <code>t.crop.season</code> fits the <strong>double hyperbolic tangent</strong>
+phenology model of Meroni et al. (2021) to each pixel’s NDVI time
+series:</p>
+<pre><code>VI(t) = a0 + a1*(tanh((t-a2)*a3)+1)/2 + a4*(tanh((t-a5)*a6)+1)/2 - a4</code></pre>
+<p>where <code>a0</code> is the background/bare-soil level, <code>a1</code>/<code>a4</code> are the
+green-up/decay amplitudes, <code>a2</code>/<code>a5</code> the inflection timings and
+<code>a3</code>/<code>a6</code> the steepness of green-up/senescence. The fit is fed the
+same amplitude-threshold estimate used as its initial guess (see
+below), so a converged fit and its fallback agree closely near the
+crossing points; the fit mainly resolves the noise the raw threshold
+crossing is sensitive to.</p>
+<p>From the fitted (or fallback) curve, three phenometrics are derived
+using a configurable fraction of the seasonal amplitude
+(<code>sos_fraction=</code>, default 50%, matching Meroni et al.’s SOS50/EOS50):</p>
+<ul>
+<li><strong>SOS</strong> — start of season (rising crossing)</li>
+<li><strong>POS</strong> — peak of season (curve maximum)</li>
+<li><strong>EOS</strong> — end of season (falling crossing)</li>
+<li><strong>amplitude</strong> and <strong>season_length</strong> (= EOS − SOS) are also written</li>
+</ul>
+<p>If a pixel has too few valid observations, too little seasonal
+amplitude, or the nonlinear fit does not converge, the module falls
+back to the same threshold crossing computed directly on the raw
+(unfitted) percentile-normalised series, rather than leaving the
+pixel empty.</p>
+<p>Pass <strong><code>-f</code></strong> (fast mode) to skip the per-pixel curve fit everywhere
+and use the vectorised amplitude-threshold method only — much faster
+on large regions, at some cost in noise robustness.</p>
+<h3 id="per-date-development-stage-classification">3. Per-date development-stage classification</h3>
+<p>Each optical acquisition date is classified, per pixel, into one of six
+stages based on its position relative to that pixel’s SOS/POS/EOS:</p>
+<table>
+<thead>
+<tr class="header">
+<th>code</th>
+<th>stage</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>0</td>
+<td>bare / pre-emergence</td>
+</tr>
+<tr class="even">
+<td>1</td>
+<td>emergence / early vegetative</td>
+</tr>
+<tr class="odd">
+<td>2</td>
+<td>vegetative</td>
+</tr>
+<tr class="even">
+<td>3</td>
+<td>reproductive / peak</td>
+</tr>
+<tr class="odd">
+<td>4</td>
+<td>senescence</td>
+</tr>
+<tr class="even">
+<td>5</td>
+<td>post-harvest / bare</td>
+</tr>
+</tbody>
+</table>
+<p>Written as the <code>&lt;output&gt;_stage</code> STRDS.</p>
+<h3 id="irrigation-status-water-cloud-model-soil-anomaly">4. Irrigation status (Water Cloud Model soil anomaly)</h3>
+<p>For each SAR acquisition date, <code>t.crop.season</code> estimates vegetation
+water content from NDVI (interpolated onto the SAR date axis),
+following Ma, Johansen &amp; McCabe (2022):</p>
+<pre><code>VWC = 0.098 * exp(4.225 * NDVI)</code></pre>
+<p>and inverts the Water Cloud Model (Attema &amp; Ulaby 1978; Bindlish &amp;
+Barros parameterisation <code>wcm_a=</code>/<code>wcm_b=</code>, default A=0.0012, B=0.091)
+to isolate the soil-driven backscatter component from the observed VV
+(and VH) backscatter:</p>
+<pre><code>tau2       = exp(-2 * wcm_b * VWC / cos(theta))
+sigma_veg  = wcm_a * VWC * cos(theta) * (1 - tau2)
+sigma_soil = (sigma_obs_linear - sigma_veg) / tau2</code></pre>
+<p>Each pixel’s driest observed soil-backscatter level (10th percentile
+over the period) is taken as a dry-soil baseline; the anomaly above
+that baseline, in dB, is written as the <code>&lt;output&gt;_vvanomaly</code> STRDS.
+Where the anomaly exceeds <code>anomaly_threshold=</code> (default 1.5 dB), a
+wetting event is flagged in <code>&lt;output&gt;_wetflag</code>:</p>
+<table>
+<thead>
+<tr class="header">
+<th>code</th>
+<th>meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>0</td>
+<td>no wetting event</td>
+</tr>
+<tr class="even">
+<td>1</td>
+<td>irrigation event</td>
+</tr>
+<tr class="odd">
+<td>2</td>
+<td>rain event</td>
+</tr>
+</tbody>
+</table>
+<p>Rain and irrigation produce the same backscatter signature and cannot
+be told apart from SAR alone. If an optional <strong><code>precip=</code></strong> STRDS is
+supplied (e.g. from
+<a href="https://github.com/YannChemin/t.in.era5">t.in.era5</a>), wetting events
+that coincide with more than <code>rain_threshold=</code> mm (default 2 mm,
+summed over the 3 days before the SAR date) of precipitation are
+reclassified as rain (code 2) rather than irrigation (code 1). Without
+<code>precip=</code>, all wetting events are reported as irrigation and this
+caveat is logged as a warning.</p>
+<h3 id="optional-random-forest-classification--c">5. Optional Random Forest classification (<code>-c</code>)</h3>
+<p>If a labeled <strong><code>training=</code></strong> vector (points or polygons; polygons are
+converted to centroids) with a <strong><code>training_column=</code></strong> attribute is
+supplied, <code>-c</code> trains a scikit-learn <code>RandomForestClassifier</code> on a
+feature stack built from this module’s own outputs — cumulative
+NDVI/NDWI over the period (Pageot et al. 2020 style), the phenology
+metrics (SOS/POS/EOS/amplitude), and summary statistics of the
+irrigation anomaly signal (mean/max anomaly, wetting-event count) —
+and applies it to the full raster to produce <code>&lt;output&gt;_classified</code>.
+This mirrors the irrigated/rainfed classification approach of Pageot
+et al. (2020) without hard-coding it to that one use case: the same
+mechanism works for any two-or-more-class label set (e.g. crop type,
+growth-stage anomaly, water-stress class) the user’s training data
+defines.</p>
+<h2 id="output-naming">Output naming</h2>
+<p>Given <code>output=field2023</code>:</p>
+<ul>
+<li>STRDS: <code>field2023_ndvi</code>, <code>field2023_ndwi</code>, <code>field2023_cr</code>,
+<code>field2023_stage</code>, <code>field2023_vvanomaly</code>, <code>field2023_wetflag</code></li>
+<li>Single-raster phenometrics: <code>field2023_sos</code>, <code>field2023_pos</code>,
+<code>field2023_eos</code>, <code>field2023_amplitude</code>, <code>field2023_season_length</code></li>
+<li>With <code>-c</code>: <code>field2023_classified</code> (plus intermediate
+<code>field2023_feat_*</code> feature rasters)</li>
+</ul>
+<h2 id="notes-and-limitations">Notes and limitations</h2>
+<ul>
+<li>Requires <code>numpy</code> and <code>scipy</code>; <code>-c</code> additionally requires
+<code>scikit-learn</code>.</li>
+<li>Reads each input raster fully into memory via
+<code>grass.script.array</code>, so processing time and memory scale with
+region size × number of dates; use <code>-f</code> and/or a coarser region for
+quick exploration before running the full fit.</li>
+<li>The incidence angle (<code>theta=</code>) is treated as a single scalar for the
+whole region; for large regions spanning a wide swath, consider
+running per-tile with a locally appropriate value.</li>
+<li><code>red</code>/<code>nir</code>/<code>swir</code> must share acquisition dates (as produced by
+<code>r.in.sentinel</code>, which imports one raster per band per date); <code>vv</code>
+and <code>vh</code> likewise.</li>
+</ul>
+<h2 id="references">References</h2>
+<ul>
+<li>Meroni, M. et al. (2021). <em>Comparing land surface phenology of major
+European crops as derived from SAR and multispectral data of
+Sentinel-1 and -2.</em> Remote Sensing of Environment, 253.
+(double hyperbolic tangent model, SOS50/EOS50/PS90)</li>
+<li>Ma, H., Johansen, K. &amp; McCabe, M.F. (2022). <em>Monitoring Irrigation
+Events and Crop Dynamics Using Sentinel-1 and Sentinel-2 Time
+Series.</em> Remote Sensing, 14(5), 1205. (Water Cloud Model
+parameterisation, VWC-from-NDVI formula, irrigation-event detection
+logic)</li>
+<li>Pageot, Y. et al. (2020). <em>Detection of Irrigated and Rainfed Crops
+in Temperate Areas Using Sentinel-1 and Sentinel-2 Time Series.</em>
+Remote Sensing, 12(18), 3044. (cumulative-index feature engineering
+for irrigation classification)</li>
+<li>d’Andrimont, R. et al. (2021). <em>From parcel to continental scale — A
+first European crop type map based on Sentinel-1 and LUCAS
+Copernicus in-situ observations.</em> Remote Sensing of Environment, 266.
+(Random Forest crop classification from VV/VH time series)</li>
+<li>Veloso, A. et al. (2017). <em>Understanding the temporal behavior of
+crops using Sentinel-1 and Sentinel-2-like data for agricultural
+applications.</em> Remote Sensing of Environment, 199.
+(crop-specific VV/VH/NDVI correlation behaviour by phenological
+stage)</li>
+<li>Harfenmeister, K. et al. (2021). <em>Detecting Phenological Development
+of Winter Wheat and Winter Barley Using Time Series of Sentinel-1
+and Sentinel-2.</em> Remote Sensing, 13(24), 5036. (breakpoint-based
+phenology detection, BBCH linkage)</li>
+<li>Xie, Q. &amp; Niculescu, S. (2022). <em>Mapping Crop Types and Monitoring
+Their Phenology Using Sentinel-1 and Sentinel-2.</em> Remote Sensing,
+14(18), 4437. (backscatter-shape based germination/heading/harvest
+detection)</li>
+</ul>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="https://github.com/YannChemin/r.in.sentinel">r.in.sentinel</a> —
+imports the Sentinel-1/2 STRDS this module consumes</li>
+<li><a href="https://github.com/YannChemin/t.in.era5">t.in.era5</a> — a source of
+the optional <code>precip=</code> STRDS</li>
+<li><em>t.rast.*</em> family of GRASS temporal addons</li>
+</ul>
