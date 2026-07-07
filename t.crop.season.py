@@ -1,0 +1,831 @@
+#!/usr/bin/env python3
+# %Module
+# % description: Derives crop development stage and irrigation status from Sentinel-1/Sentinel-2 time series (STRDS) over a period of interest.
+# % keyword: imagery
+# % keyword: temporal
+# % keyword: satellite
+# % keyword: Sentinel
+# % keyword: Sentinel-1
+# % keyword: Sentinel-2
+# % keyword: crop
+# % keyword: phenology
+# % keyword: irrigation
+# % keyword: agriculture
+# %end
+
+# %option G_OPT_STRDS_INPUT
+# % key: red
+# % description: STRDS of Sentinel-2 red reflectance (e.g. B04)
+# %end
+
+# %option G_OPT_STRDS_INPUT
+# % key: nir
+# % description: STRDS of Sentinel-2 NIR reflectance (e.g. B08)
+# %end
+
+# %option G_OPT_STRDS_INPUT
+# % key: swir
+# % description: STRDS of Sentinel-2 SWIR reflectance (e.g. B11), used for NDWI
+# %end
+
+# %option G_OPT_STRDS_INPUT
+# % key: vv
+# % description: STRDS of Sentinel-1 VV backscatter (dB)
+# %end
+
+# %option G_OPT_STRDS_INPUT
+# % key: vh
+# % description: STRDS of Sentinel-1 VH backscatter (dB)
+# %end
+
+# %option G_OPT_STRDS_INPUT
+# % key: precip
+# % required: no
+# % description: Optional STRDS of precipitation (e.g. from t.in.era5), used to separate rain from irrigation
+# %end
+
+# %option
+# % key: start
+# % type: string
+# % required: yes
+# % description: Start date of period of interest (YYYY-MM-DD)
+# %end
+
+# %option
+# % key: end
+# % type: string
+# % required: yes
+# % description: End date of period of interest (YYYY-MM-DD)
+# %end
+
+# %option G_OPT_R_OUTPUT
+# % key: output
+# % description: Prefix for output raster maps and STRDS
+# %end
+
+# %option
+# % key: theta
+# % type: double
+# % required: no
+# % answer: 31.0
+# % description: Sentinel-1 incidence angle in degrees, used by the Water Cloud Model
+# %end
+
+# %option
+# % key: wcm_a
+# % type: double
+# % required: no
+# % answer: 0.0012
+# % description: Water Cloud Model vegetation coefficient A (Bindlish & Barros)
+# %end
+
+# %option
+# % key: wcm_b
+# % type: double
+# % required: no
+# % answer: 0.091
+# % description: Water Cloud Model vegetation coefficient B (Bindlish & Barros)
+# %end
+
+# %option
+# % key: anomaly_threshold
+# % type: double
+# % required: no
+# % answer: 1.5
+# % description: Soil backscatter anomaly threshold (dB above dry baseline) to flag a wetting event
+# %end
+
+# %option
+# % key: rain_threshold
+# % type: double
+# % required: no
+# % answer: 2.0
+# % description: Precipitation threshold (mm, summed over the 3 days before a SAR date) below which a wetting event is attributed to irrigation rather than rain
+# %end
+
+# %option
+# % key: sos_fraction
+# % type: double
+# % required: no
+# % answer: 0.5
+# % description: Fraction of seasonal amplitude used to define start/end of season crossings
+# %end
+
+# %option
+# % key: baseline_percentile
+# % type: double
+# % required: no
+# % answer: 5.0
+# % description: Percentile of the NDVI time series used as the season baseline (background/bare-soil level)
+# %end
+
+# %option
+# % key: peak_percentile
+# % type: double
+# % required: no
+# % answer: 95.0
+# % description: Percentile of the NDVI time series used as the season peak level
+# %end
+
+# %option G_OPT_V_INPUT
+# % key: training
+# % required: no
+# % description: Optional vector map of training points/polygons for Random Forest classification
+# %end
+
+# %option G_OPT_DB_COLUMN
+# % key: training_column
+# % required: no
+# % description: Attribute column in the training vector holding class labels
+# %end
+
+# %flag
+# % key: c
+# % description: Train and apply a Random Forest classifier using the training vector (requires training= and training_column=)
+# %end
+
+# %flag
+# % key: f
+# % description: Fast mode - use amplitude-threshold phenology only, skip the per-pixel double-tanh curve fit
+# %end
+
+# %rules
+# % requires: -c, training
+# % requires: -c, training_column
+# %end
+
+import sys
+from datetime import datetime, timedelta
+
+import grass.script as gs
+
+
+# ---------------------------------------------------------------------------
+# Development-stage class codes, shared between the classification logic and
+# the r.category labels written onto the output STRDS.
+# ---------------------------------------------------------------------------
+STAGE_LABELS = {
+    0: "bare / pre-emergence",
+    1: "emergence / early vegetative",
+    2: "vegetative",
+    3: "reproductive / peak",
+    4: "senescence",
+    5: "post-harvest / bare",
+}
+
+STAGE_CATEGORY_RULES = "\n".join(f"{k}|{v}" for k, v in STAGE_LABELS.items()) + "\n"
+
+
+def strds_maps(strds_name, start, end):
+    """Return a sorted list of (map_name, datetime) registered in strds_name
+    within [start, end] (inclusive), using t.rast.list."""
+    where = f"start_time >= '{start}' and start_time <= '{end} 23:59:59'"
+    out = gs.read_command(
+        "t.rast.list",
+        input=strds_name,
+        columns="name,start_time",
+        where=where,
+        separator="|",
+        quiet=True,
+    )
+    maps = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or line.startswith("name|"):
+            continue
+        name, start_time = line.split("|", 1)
+        # t.rast.list start_time format: "YYYY-MM-DD HH:MM:SS[.ffffff]"
+        start_time = start_time.split(".")[0]
+        dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
+        maps.append((name, dt))
+    maps.sort(key=lambda m: m[1])
+    return maps
+
+
+def days_since(dates, ref):
+    """Convert a list of datetime objects to a numpy array of float days since ref."""
+    import numpy as np
+
+    return np.array([(d - ref).total_seconds() / 86400.0 for d in dates])
+
+
+def read_stack(map_names):
+    """Read a list of raster map names into a 3D numpy array (time, row, col)."""
+    import numpy as np
+    from grass.script import array as garray
+
+    arrays = []
+    for name in map_names:
+        a = garray.array(mapname=name)
+        arrays.append(np.array(a, dtype=np.float64))
+    return np.stack(arrays, axis=0)
+
+
+def write_raster(arr, mapname, nodata_value=None, categorical=False):
+    """Write a 2D numpy array as a GRASS raster map.
+
+    categorical=True writes a CELL (integer) map, needed for outputs that
+    get r.category/r.colors treatments requiring a discrete raster (e.g.
+    color=random, which r.colors refuses on floating-point maps).
+    """
+    import numpy as np
+    from grass.script import array as garray
+
+    dtype = np.int32 if categorical else np.float64
+    out = garray.array(dtype=dtype)
+    if categorical:
+        arr = np.where(np.isfinite(arr), arr, -1)
+    elif nodata_value is not None:
+        arr = np.where(np.isfinite(arr), arr, nodata_value)
+    out[...] = arr
+    out.write(mapname=mapname, overwrite=True, null=-1 if categorical else None)
+
+
+def double_tanh(t, a0, a1, a2, a3, a4, a5, a6):
+    """Meroni et al. (2021) double hyperbolic tangent phenology model."""
+    import numpy as np
+
+    green_up = a1 * (np.tanh((t - a2) * a3) + 1.0) / 2.0
+    decay = a4 * (np.tanh((t - a5) * a6) + 1.0) / 2.0 - a4
+    return a0 + green_up + decay
+
+
+def fit_pixel_phenology(t, y, baseline_pct, peak_pct, sos_fraction):
+    """Fit the double-tanh model to one pixel's NDVI time series.
+
+    Returns a dict with sos, pos, eos, amplitude, baseline, or None if the
+    pixel cannot be characterised (too few valid observations, or the fit
+    does not converge and the amplitude fallback also fails).
+    """
+    import numpy as np
+    from scipy.optimize import curve_fit
+
+    valid = np.isfinite(y)
+    if valid.sum() < 8:
+        return None
+
+    tv = t[valid]
+    yv = y[valid]
+
+    baseline = np.percentile(yv, baseline_pct)
+    peak = np.percentile(yv, peak_pct)
+    amplitude = peak - baseline
+    if amplitude < 0.1:
+        return None
+
+    # Amplitude-threshold estimate (Meroni et al. "SOS50/EOS50"), used both as
+    # the initial guess for the curve fit and as the fallback when the fit
+    # itself does not converge.
+    threshold = baseline + sos_fraction * amplitude
+    peak_idx = np.argmax(yv)
+    rising = np.where((yv[:peak_idx] < threshold))[0]
+    sos_fallback = tv[rising[-1] + 1] if len(rising) and rising[-1] + 1 < peak_idx else tv[0]
+    falling = np.where((yv[peak_idx:] < threshold))[0]
+    eos_fallback = tv[peak_idx + falling[0]] if len(falling) else tv[-1]
+    pos_fallback = tv[peak_idx]
+
+    fallback = {
+        "sos": float(sos_fallback),
+        "pos": float(pos_fallback),
+        "eos": float(eos_fallback),
+        "amplitude": float(amplitude),
+        "baseline": float(baseline),
+    }
+
+    if valid.sum() < 3 + 3:
+        # Not enough points to trust a 7-parameter fit; keep the fallback.
+        return fallback
+
+    p0 = [
+        baseline,
+        amplitude,
+        sos_fallback,
+        0.15,
+        amplitude,
+        eos_fallback,
+        0.15,
+    ]
+    try:
+        popt, _ = curve_fit(double_tanh, tv, yv, p0=p0, maxfev=2000)
+        a0, a1, a2, a3, a4, a5, a6 = popt
+        fit_amplitude = a1
+        if fit_amplitude < 0.05 or a2 >= a5:
+            return fallback
+        fit_t = np.linspace(tv[0], tv[-1], 400)
+        fit_y = double_tanh(fit_t, *popt)
+        fit_peak_idx = np.argmax(fit_y)
+        threshold_fit = a0 + sos_fraction * a1
+        rising = np.where(fit_y[:fit_peak_idx] < threshold_fit)[0]
+        sos = fit_t[rising[-1] + 1] if len(rising) and rising[-1] + 1 < fit_peak_idx else fit_t[0]
+        falling = np.where(fit_y[fit_peak_idx:] < threshold_fit)[0]
+        eos = fit_t[fit_peak_idx + falling[0]] if len(falling) else fit_t[-1]
+        return {
+            "sos": float(sos),
+            "pos": float(fit_t[fit_peak_idx]),
+            "eos": float(eos),
+            "amplitude": float(fit_amplitude),
+            "baseline": float(a0),
+        }
+    except (RuntimeError, ValueError):
+        return fallback
+
+
+def compute_phenology(ndvi_stack, t_days, baseline_pct, peak_pct, sos_fraction, fast):
+    """Compute SOS/POS/EOS/amplitude/baseline rasters (2D) from an NDVI stack.
+
+    fast=True skips the per-pixel curve fit and uses the vectorised
+    amplitude-threshold method everywhere (much faster, slightly noisier).
+    """
+    import numpy as np
+
+    n_time, n_rows, n_cols = ndvi_stack.shape
+    sos = np.full((n_rows, n_cols), np.nan)
+    pos = np.full((n_rows, n_cols), np.nan)
+    eos = np.full((n_rows, n_cols), np.nan)
+    amplitude = np.full((n_rows, n_cols), np.nan)
+    baseline = np.full((n_rows, n_cols), np.nan)
+
+    if fast:
+        baseline_arr = np.nanpercentile(ndvi_stack, baseline_pct, axis=0)
+        peak_arr = np.nanpercentile(ndvi_stack, peak_pct, axis=0)
+        amp_arr = peak_arr - baseline_arr
+        threshold = baseline_arr + sos_fraction * amp_arr
+        peak_idx = np.nanargmax(ndvi_stack, axis=0)
+
+        for r in range(n_rows):
+            for c in range(n_cols):
+                if not np.isfinite(amp_arr[r, c]) or amp_arr[r, c] < 0.1:
+                    continue
+                series = ndvi_stack[:, r, c]
+                pidx = peak_idx[r, c]
+                th = threshold[r, c]
+                rising = np.where(series[:pidx] < th)[0]
+                sos_i = rising[-1] + 1 if len(rising) and rising[-1] + 1 < pidx else 0
+                falling = np.where(series[pidx:] < th)[0]
+                eos_i = pidx + falling[0] if len(falling) else n_time - 1
+                sos[r, c] = t_days[sos_i]
+                pos[r, c] = t_days[pidx]
+                eos[r, c] = t_days[eos_i]
+                amplitude[r, c] = amp_arr[r, c]
+                baseline[r, c] = baseline_arr[r, c]
+        return sos, pos, eos, amplitude, baseline
+
+    gs.message("Fitting double hyperbolic tangent phenology model per pixel ...")
+    total = n_rows * n_cols
+    done = 0
+    for r in range(n_rows):
+        for c in range(n_cols):
+            done += 1
+            if done % max(1, total // 20) == 0:
+                gs.percent(done, total, 5)
+            series = ndvi_stack[:, r, c]
+            result = fit_pixel_phenology(t_days, series, baseline_pct, peak_pct, sos_fraction)
+            if result is None:
+                continue
+            sos[r, c] = result["sos"]
+            pos[r, c] = result["pos"]
+            eos[r, c] = result["eos"]
+            amplitude[r, c] = result["amplitude"]
+            baseline[r, c] = result["baseline"]
+    gs.percent(1, 1, 1)
+    return sos, pos, eos, amplitude, baseline
+
+
+def classify_stage(date_days, sos, pos, eos):
+    """Vectorised per-date development-stage classification (see STAGE_LABELS)."""
+    import numpy as np
+
+    stage = np.full(sos.shape, np.nan)
+    valid = np.isfinite(sos) & np.isfinite(pos) & np.isfinite(eos)
+
+    mid_veg = sos + (pos - sos) / 2.0
+    peak_tol = np.maximum((eos - sos) * 0.1, 3.0)
+
+    bare_pre = valid & (date_days < sos)
+    early_veg = valid & (date_days >= sos) & (date_days < mid_veg)
+    late_veg = valid & (date_days >= mid_veg) & (date_days < (pos - peak_tol))
+    peak = valid & (date_days >= (pos - peak_tol)) & (date_days <= (pos + peak_tol))
+    senescence = valid & (date_days > (pos + peak_tol)) & (date_days < eos)
+    post_harvest = valid & (date_days >= eos)
+
+    stage[bare_pre] = 0
+    stage[early_veg] = 1
+    stage[late_veg] = 2
+    stage[peak] = 3
+    stage[senescence] = 4
+    stage[post_harvest] = 5
+    return stage
+
+
+def interp_to(target_days, source_days, source_stack):
+    """Linearly interpolate a (time, row, col) stack from source_days onto
+    target_days, per pixel, extrapolating with edge values."""
+    import numpy as np
+
+    n_rows, n_cols = source_stack.shape[1:]
+    out = np.full((len(target_days), n_rows, n_cols), np.nan)
+    for r in range(n_rows):
+        for c in range(n_cols):
+            series = source_stack[:, r, c]
+            valid = np.isfinite(series)
+            if valid.sum() < 2:
+                continue
+            out[:, r, c] = np.interp(target_days, source_days[valid], series[valid])
+    return out
+
+
+def compute_irrigation(
+    vv_db,
+    vh_db,
+    ndvi_interp,
+    theta_deg,
+    wcm_a,
+    wcm_b,
+    anomaly_threshold,
+    precip_recent,
+    rain_threshold,
+):
+    """Water Cloud Model based soil backscatter anomaly and wetting-event flag.
+
+    Returns dict of 3D (time,row,col) arrays: vv_anomaly_db, vh_anomaly_db,
+    wetting_flag (0/1/2: none/irrigation/rain).
+    """
+    import numpy as np
+
+    theta = np.radians(theta_deg)
+    vwc = 0.098 * np.exp(4.225 * np.clip(ndvi_interp, -1.0, 1.0))
+    tau2 = np.exp(-2.0 * wcm_b * vwc / np.cos(theta))
+
+    results = {}
+    for pol_name, sigma_db in (("vv", vv_db), ("vh", vh_db)):
+        sigma_lin = 10.0 ** (sigma_db / 10.0)
+        sigma_veg = wcm_a * vwc * np.cos(theta) * (1.0 - tau2)
+        sigma_soil = (sigma_lin - sigma_veg) / np.where(tau2 == 0, np.nan, tau2)
+        sigma_soil = np.where(sigma_soil > 0, sigma_soil, np.nan)
+        dry_baseline = np.nanpercentile(sigma_soil, 10, axis=0)
+        anomaly_db = 10.0 * np.log10(sigma_soil / dry_baseline)
+        results[f"{pol_name}_anomaly_db"] = anomaly_db
+
+    wetting = (results["vv_anomaly_db"] > anomaly_threshold).astype(np.float64)
+    wetting[~np.isfinite(results["vv_anomaly_db"])] = np.nan
+
+    flag = np.where(wetting == 1, 1.0, 0.0)  # default: irrigation
+    if precip_recent is not None:
+        rained = precip_recent > rain_threshold
+        flag = np.where((wetting == 1) & rained, 2.0, flag)  # reclassify as rain
+    flag[~np.isfinite(results["vv_anomaly_db"])] = np.nan
+    results["wetting_flag"] = flag
+    return results
+
+
+def register_strds(strds_name, title, description, map_names, dates, ttype="strds"):
+    gs.run_command(
+        "t.create",
+        type=ttype,
+        temporaltype="absolute",
+        output=strds_name,
+        title=title,
+        description=description,
+        overwrite=True,
+        quiet=True,
+    )
+    for name, dt in zip(map_names, dates):
+        gs.run_command("r.timestamp", map=name, date=dt.strftime("%d %b %Y %H:%M:%S"), quiet=True)
+    gs.run_command(
+        "t.register",
+        type="raster",
+        input=strds_name,
+        maps=",".join(map_names),
+        overwrite=True,
+        quiet=True,
+    )
+
+
+def main():
+    import numpy as np
+
+    options, flags = gs.parser()
+
+    red_strds = options["red"]
+    nir_strds = options["nir"]
+    swir_strds = options["swir"]
+    vv_strds = options["vv"]
+    vh_strds = options["vh"]
+    precip_strds = options["precip"] or None
+    start = options["start"]
+    end = options["end"]
+    output = options["output"]
+    theta_deg = float(options["theta"])
+    wcm_a = float(options["wcm_a"])
+    wcm_b = float(options["wcm_b"])
+    anomaly_threshold = float(options["anomaly_threshold"])
+    rain_threshold = float(options["rain_threshold"])
+    sos_fraction = float(options["sos_fraction"])
+    baseline_pct = float(options["baseline_percentile"])
+    peak_pct = float(options["peak_percentile"])
+    training = options["training"] or None
+    training_column = options["training_column"] or None
+    do_classify = flags["c"]
+    fast_mode = flags["f"]
+
+    try:
+        import grass.temporal as tgis
+
+        tgis.init()
+    except Exception as e:
+        gs.fatal(f"Failed to initialise the temporal framework: {e}")
+
+    # --- Gather optical (S2) and SAR (S1) date axes -----------------------
+    gs.message("Reading STRDS registrations ...")
+    red_maps = strds_maps(red_strds, start, end)
+    nir_maps = strds_maps(nir_strds, start, end)
+    swir_maps = strds_maps(swir_strds, start, end)
+    vv_maps = strds_maps(vv_strds, start, end)
+    vh_maps = strds_maps(vh_strds, start, end)
+
+    if not red_maps or not nir_maps:
+        gs.fatal("No red/NIR maps found in the given period; cannot compute NDVI.")
+    if not vv_maps or not vh_maps:
+        gs.fatal("No VV/VH maps found in the given period; cannot compute SAR features.")
+
+    # Optical dates: intersection of red, nir, swir (same acquisition, i.e.
+    # same calendar date already resampled onto one grid by r.in.sentinel).
+    red_by_date = {d.date(): n for n, d in red_maps}
+    nir_by_date = {d.date(): n for n, d in nir_maps}
+    swir_by_date = {d.date(): n for n, d in swir_maps}
+    optical_dates = sorted(set(red_by_date) & set(nir_by_date) & set(swir_by_date))
+    if not optical_dates:
+        gs.fatal("red/nir/swir STRDS have no common acquisition dates.")
+
+    vv_by_date = {d.date(): n for n, d in vv_maps}
+    vh_by_date = {d.date(): n for n, d in vh_maps}
+    sar_dates = sorted(set(vv_by_date) & set(vh_by_date))
+    if not sar_dates:
+        gs.fatal("vv/vh STRDS have no common acquisition dates.")
+
+    ref = datetime.combine(optical_dates[0], datetime.min.time())
+
+    # --- NDVI / NDWI / CR per date -----------------------------------------
+    gs.message(f"Computing NDVI/NDWI for {len(optical_dates)} date(s) ...")
+    ndvi_maps, ndwi_maps = [], []
+    ndvi_dt = []
+    for d in optical_dates:
+        red_m, nir_m, swir_m = red_by_date[d], nir_by_date[d], swir_by_date[d]
+        ndvi_m = f"{output}_ndvi_{d.strftime('%Y%m%d')}"
+        ndwi_m = f"{output}_ndwi_{d.strftime('%Y%m%d')}"
+        gs.mapcalc(f"{ndvi_m} = float({nir_m} - {red_m}) / float({nir_m} + {red_m})", overwrite=True, quiet=True)
+        gs.mapcalc(f"{ndwi_m} = float({nir_m} - {swir_m}) / float({nir_m} + {swir_m})", overwrite=True, quiet=True)
+        ndvi_maps.append(ndvi_m)
+        ndwi_maps.append(ndwi_m)
+        ndvi_dt.append(datetime.combine(d, datetime.min.time()))
+
+    gs.message(f"Computing SAR cross-ratio (VH-VV, dB) for {len(sar_dates)} date(s) ...")
+    cr_maps = []
+    sar_dt = []
+    for d in sar_dates:
+        vv_m, vh_m = vv_by_date[d], vh_by_date[d]
+        cr_m = f"{output}_cr_{d.strftime('%Y%m%d')}"
+        gs.mapcalc(f"{cr_m} = float({vh_m} - {vv_m})", overwrite=True, quiet=True)
+        cr_maps.append(cr_m)
+        sar_dt.append(datetime.combine(d, datetime.min.time()))
+
+    register_strds(
+        f"{output}_ndvi", "NDVI time series", "NDVI computed by t.crop.season", ndvi_maps, ndvi_dt
+    )
+    register_strds(
+        f"{output}_ndwi", "NDWI time series", "NDWI computed by t.crop.season", ndwi_maps, ndvi_dt
+    )
+    register_strds(
+        f"{output}_cr", "SAR cross-ratio (VH-VV, dB) time series",
+        "SAR cross-ratio computed by t.crop.season", cr_maps, sar_dt,
+    )
+
+    # --- Phenology ----------------------------------------------------------
+    gs.message("Reading NDVI raster stack ...")
+    ndvi_stack = read_stack(ndvi_maps)
+    t_days = days_since(ndvi_dt, ref)
+
+    sos, pos, eos, amplitude, baseline = compute_phenology(
+        ndvi_stack, t_days, baseline_pct, peak_pct, sos_fraction, fast_mode
+    )
+
+    for name, arr in (
+        ("sos", sos),
+        ("pos", pos),
+        ("eos", eos),
+        ("amplitude", amplitude),
+        ("season_length", eos - sos),
+    ):
+        mapname = f"{output}_{name}"
+        write_raster(arr, mapname)
+        gs.run_command(
+            "r.support", map=mapname,
+            title=f"t.crop.season {name}",
+            units="days since " + ref.strftime("%Y-%m-%d") if name != "amplitude" else "NDVI units",
+            history=f"t.crop.season phenology output ({name})",
+            quiet=True,
+        )
+    gs.message(f"Phenology rasters written: {output}_sos, {output}_pos, {output}_eos, "
+               f"{output}_amplitude, {output}_season_length")
+
+    # --- Per-date development-stage classification --------------------------
+    gs.message("Classifying development stage per date ...")
+    stage_maps = []
+    for d, dt in zip(optical_dates, ndvi_dt):
+        day = (dt - ref).total_seconds() / 86400.0
+        stage_arr = classify_stage(np.full(sos.shape, day), sos, pos, eos)
+        stage_m = f"{output}_stage_{d.strftime('%Y%m%d')}"
+        write_raster(stage_arr, stage_m, categorical=True)
+        gs.run_command("r.colors", map=stage_m, color="bgyr", quiet=True)
+        gs.write_command(
+            "r.category", map=stage_m, separator="pipe", rules="-", stdin=STAGE_CATEGORY_RULES, quiet=True
+        )
+        stage_maps.append(stage_m)
+    register_strds(
+        f"{output}_stage", "Crop development stage",
+        "Development stage classification computed by t.crop.season", stage_maps, ndvi_dt,
+    )
+
+    # --- Irrigation -----------------------------------------------------------
+    gs.message("Computing Water Cloud Model soil backscatter anomaly ...")
+    vv_stack = read_stack([vv_by_date[d] for d in sar_dates])
+    vh_stack = read_stack([vh_by_date[d] for d in sar_dates])
+    sar_days = days_since(sar_dt, ref)
+
+    ndvi_on_sar = interp_to(sar_days, t_days, ndvi_stack)
+
+    precip_recent = None
+    if precip_strds:
+        precip_maps = strds_maps(precip_strds, start, end)
+        if precip_maps:
+            precip_by_date = {d.date(): n for n, d in precip_maps}
+            precip_all_dates = sorted(precip_by_date)
+            precip_dt = [datetime.combine(d, datetime.min.time()) for d in precip_all_dates]
+            precip_stack = read_stack([precip_by_date[d] for d in precip_all_dates])
+            precip_days = days_since(precip_dt, ref)
+            # sum precipitation over the 3 days preceding each SAR acquisition
+            precip_recent = np.zeros((len(sar_days),) + precip_stack.shape[1:])
+            for i, day in enumerate(sar_days):
+                window = (precip_days >= day - 3) & (precip_days <= day)
+                if window.any():
+                    precip_recent[i] = np.nansum(precip_stack[window], axis=0)
+        else:
+            gs.warning("Precipitation STRDS has no maps in the given period; ignoring it.")
+
+    irrigation = compute_irrigation(
+        vv_stack, vh_stack, ndvi_on_sar, theta_deg, wcm_a, wcm_b,
+        anomaly_threshold, precip_recent, rain_threshold,
+    )
+
+    anomaly_maps, flag_maps = [], []
+    for i, d in enumerate(sar_dates):
+        anomaly_m = f"{output}_vvanomaly_{d.strftime('%Y%m%d')}"
+        flag_m = f"{output}_wetflag_{d.strftime('%Y%m%d')}"
+        write_raster(irrigation["vv_anomaly_db"][i], anomaly_m)
+        write_raster(irrigation["wetting_flag"][i], flag_m, categorical=True)
+        gs.run_command("r.colors", map=anomaly_m, color="differences", quiet=True)
+        gs.write_command(
+            "r.category", map=flag_m, separator="pipe", rules="-",
+            stdin="0|no wetting event\n1|irrigation event\n2|rain event\n", quiet=True,
+        )
+        anomaly_maps.append(anomaly_m)
+        flag_maps.append(flag_m)
+
+    register_strds(
+        f"{output}_vvanomaly", "VV soil backscatter anomaly (dB above dry baseline)",
+        "Water Cloud Model soil anomaly computed by t.crop.season", anomaly_maps, sar_dt,
+    )
+    register_strds(
+        f"{output}_wetflag", "Wetting event flag (0=none, 1=irrigation, 2=rain)",
+        "Wetting event classification computed by t.crop.season", flag_maps, sar_dt,
+    )
+    gs.message(
+        f"Irrigation outputs written: STRDS {output}_vvanomaly, {output}_wetflag"
+        + (" (rain-aware)" if precip_recent is not None else " (rain not distinguished - no precip= given)")
+    )
+
+    # --- Optional Random Forest classification -------------------------------
+    if do_classify:
+        train_and_classify(
+            output=output,
+            training=training,
+            training_column=training_column,
+            ndvi_maps=ndvi_maps,
+            ndwi_maps=ndwi_maps,
+            sos=sos, pos=pos, eos=eos, amplitude=amplitude,
+            vvanomaly_stack=irrigation["vv_anomaly_db"],
+            wetflag_stack=irrigation["wetting_flag"],
+        )
+
+    gs.message("t.crop.season finished.")
+    return 0
+
+
+def train_and_classify(
+    output, training, training_column, ndvi_maps, ndwi_maps,
+    sos, pos, eos, amplitude, vvanomaly_stack, wetflag_stack,
+):
+    """Train a Random Forest classifier on engineered features sampled at the
+    training vector's points, then apply it to the full feature stack."""
+    import numpy as np
+
+    try:
+        from sklearn.ensemble import RandomForestClassifier
+    except ImportError:
+        gs.fatal("scikit-learn is required for -c (pip install scikit-learn).")
+
+    gs.message("Building feature stack for classification ...")
+
+    # Cumulative NDVI/NDWI over the period (Pageot et al. style single feature
+    # per index rather than a full time series) plus the phenology metrics and
+    # a summary of the irrigation anomaly signal.
+    ndvi_cum = f"{output}_feat_ndvi_cum"
+    ndwi_cum = f"{output}_feat_ndwi_cum"
+    gs.run_command("r.series", input=ndvi_maps, output=ndvi_cum, method="sum", overwrite=True, quiet=True)
+    gs.run_command("r.series", input=ndwi_maps, output=ndwi_cum, method="sum", overwrite=True, quiet=True)
+
+    vvanomaly_mean = np.nanmean(vvanomaly_stack, axis=0)
+    vvanomaly_max = np.nanmax(vvanomaly_stack, axis=0)
+    wetflag_count = np.nansum(wetflag_stack == 1, axis=0)
+
+    feature_maps = {
+        "sos": sos, "pos": pos, "eos": eos, "amplitude": amplitude,
+        "vvanomaly_mean": vvanomaly_mean, "vvanomaly_max": vvanomaly_max,
+        "wetflag_count": wetflag_count,
+    }
+    feature_names = list(feature_maps.keys()) + ["ndvi_cum", "ndwi_cum"]
+    for name, arr in feature_maps.items():
+        write_raster(arr, f"{output}_feat_{name}")
+
+    all_feature_maps = [f"{output}_feat_{n}" for n in feature_maps] + [ndvi_cum, ndwi_cum]
+
+    gs.message("Sampling features and labels at training locations ...")
+    # v.to.points (type=point,centroid) keeps the source vector's attribute
+    # table as-is on layer 1 (same cat, same table) - so training_column is
+    # already present and we can add feature columns straight onto it,
+    # no layer-2/join gymnastics needed.
+    training_points = f"{output}_training_points_tmp"
+    gs.run_command(
+        "v.to.points", input=training, output=training_points,
+        type="point,centroid", overwrite=True, quiet=True,
+    )
+    gs.run_command(
+        "v.db.addcolumn", map=training_points,
+        columns=",".join(f"{n} double precision" for n in feature_names), quiet=True,
+    )
+    for fmap, fname in zip(all_feature_maps, feature_names):
+        gs.run_command("v.what.rast", map=training_points, raster=fmap, column=fname, quiet=True)
+
+    columns = ["cat", training_column] + feature_names
+    table = gs.read_command(
+        "v.db.select", map=training_points, columns=",".join(columns), separator="|", quiet=True
+    )
+    rows = [line.split("|") for line in table.splitlines()[1:] if line.strip()]
+    X_train, y_train = [], []
+    for row in rows:
+        try:
+            label = row[1]
+            feats = [float(v) for v in row[2:]]
+        except (ValueError, IndexError):
+            continue
+        if any(f != f for f in feats):  # NaN check
+            continue
+        X_train.append(feats)
+        y_train.append(label)
+
+    if len(X_train) < 10:
+        gs.fatal("Fewer than 10 usable training samples after feature sampling; aborting classification.")
+
+    gs.message(f"Training Random Forest on {len(X_train)} samples, {len(feature_names)} features ...")
+    clf = RandomForestClassifier(n_estimators=300, max_features="sqrt", n_jobs=-1, random_state=0)
+    clf.fit(X_train, y_train)
+
+    gs.message("Applying classifier to full raster stack ...")
+    from grass.script import array as garray
+
+    stack = np.stack([np.array(garray.array(mapname=m), dtype=np.float64) for m in all_feature_maps], axis=-1)
+    rows_n, cols_n, n_feat = stack.shape
+    flat = stack.reshape(-1, n_feat)
+    valid = np.all(np.isfinite(flat), axis=1)
+
+    labels_sorted = sorted(set(y_train))
+    label_to_code = {label: i + 1 for i, label in enumerate(labels_sorted)}
+    pred_codes = np.zeros(flat.shape[0])
+    if valid.any():
+        preds = clf.predict(flat[valid])
+        pred_codes[valid] = [label_to_code[p] for p in preds]
+    pred_codes[~valid] = np.nan
+    classified = pred_codes.reshape(rows_n, cols_n)
+
+    out_map = f"{output}_classified"
+    write_raster(classified, out_map, categorical=True)
+    cat_rules = "\n".join(f"{code}|{label}" for label, code in label_to_code.items()) + "\n"
+    gs.write_command("r.category", map=out_map, separator="pipe", rules="-", stdin=cat_rules, quiet=True)
+    gs.run_command("r.colors", map=out_map, color="random", quiet=True)
+    gs.message(f"Classification written to raster map '{out_map}'")
+
+    gs.run_command("g.remove", type="vector", name=training_points, flags="f", quiet=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
