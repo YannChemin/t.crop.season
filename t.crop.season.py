@@ -167,6 +167,22 @@
 # % description: Maximum number of per-pixel cycles to keep/write with -m (a pixel with more detected cycles keeps only the most recent max_cycles)
 # %end
 
+# %option
+# % key: sar_gap_days
+# % type: double
+# % required: no
+# % answer: 10
+# % description: With -m, a Sentinel-1 (cross-ratio) observation is only added to the crossing-detection series if no NDVI observation exists within this many days of it - lets SAR fill cloud gaps without displacing optical data where both are available
+# %end
+
+# %option
+# % key: harvest_snap_days
+# % type: double
+# % required: no
+# % answer: 20
+# % description: With -m, each detected harvest (EOS) date is refined to the sharpest Sentinel-1 cross-ratio drop within this many days of the NDVI-based estimate (a ratoon cut's bare-soil exposure is a cleaner SAR signal than NDVI's gradual senescence); 0 disables snapping
+# %end
+
 # %option G_OPT_V_INPUT
 # % key: training
 # % required: no
@@ -191,7 +207,7 @@
 
 # %flag
 # % key: m
-# % description: Multi-cycle mode - detect ALL per-pixel planting(SOS)/harvest(EOS) cycles over the period (not just one whole-record fit), with noise-merging and a minimum cycle length, suitable for annual crops with several cycles in the record AND for perennial/ratoon crops (e.g. sugarcane) with one long cycle. Writes <output>_cycleN_sos/_eos, <output>_ncycles, <output>_last_sos/_last_eos/_last_still_growing (the last-cycle triplet t.crop.yield's season_sos=/season_eos=/season_still_growing= options expect).
+# % description: Multi-cycle mode - detect ALL per-pixel planting(SOS)/harvest(EOS) cycles over the period (not just one whole-record fit), fusing Sentinel-2 NDVI (primary) with Sentinel-1 cross-ratio (cloud-gap-fill + harvest-date snapping) and with noise-merging and a minimum cycle length, suitable for annual crops with several cycles in the record AND for perennial/ratoon crops (e.g. sugarcane) with one long cycle. Writes <output>_cycleN_sos/_eos, <output>_ncycles, <output>_last_sos/_last_eos/_last_still_growing (the last-cycle triplet t.crop.yield's season_sos=/season_eos=/season_still_growing= options expect).
 # %end
 
 # %rules
@@ -454,10 +470,69 @@ def smooth_series(y, window):
     return out
 
 
+def normalize_to_reference(series, baseline_pct, peak_pct, ref_baseline, ref_amplitude):
+    """Percentile-normalize `series` onto the same [ref_baseline,
+    ref_baseline + ref_amplitude] scale as a reference series (here, one
+    pixel's own NDVI baseline/amplitude), so a secondary signal (SAR cross-
+    ratio) becomes directly comparable against the same sos_fraction
+    threshold NDVI is tested against. Self-calibrating per pixel: only the
+    *direction* of the relationship (more vegetation -> higher value) is
+    assumed, not an absolute VV/VH-to-NDVI conversion."""
+    import numpy as np
+
+    valid = np.isfinite(series)
+    if valid.sum() < 3:
+        return np.full_like(series, np.nan)
+    lo = np.percentile(series[valid], baseline_pct)
+    hi = np.percentile(series[valid], peak_pct)
+    spread = hi - lo
+    if spread <= 0:
+        return np.full_like(series, np.nan)
+    frac = (series - lo) / spread
+    return ref_baseline + frac * ref_amplitude
+
+
+def snap_eos_to_sar(eos_day, sar_t, sar_y, window_days):
+    """Refine one candidate EOS (harvest) date using the SAR cross-ratio.
+
+    A harvest/ratoon cut is a discrete structural event - vegetation
+    (volume-scattering) canopy is suddenly replaced by bare/stubble soil
+    (surface/double-bounce scattering), which shows up as a sharp DROP in
+    the cross-ratio (VH-VV, dB). That's a cleaner, higher-frequency signal
+    for the exact harvest date than NDVI's gradual senescence decline, and
+    SAR is cloud-independent so it's available even when optical isn't.
+    Returns the date right after the steepest CR drop within
+    [eos_day-window_days, eos_day+window_days], or the original eos_day
+    unchanged if no SAR data / no actual drop is found in that window."""
+    import numpy as np
+
+    valid = np.isfinite(sar_y)
+    if valid.sum() < 2:
+        return eos_day
+    tv, yv = sar_t[valid], sar_y[valid]
+    order = np.argsort(tv)
+    tv, yv = tv[order], yv[order]
+
+    in_window = (tv >= eos_day - window_days) & (tv <= eos_day + window_days)
+    idxs = np.where(in_window)[0]
+    if len(idxs) < 2:
+        return eos_day
+    lo, hi = idxs[0], idxs[-1]
+    diffs = np.diff(yv[lo:hi + 1])
+    if len(diffs) == 0:
+        return eos_day
+    steepest = np.argmin(diffs)
+    if diffs[steepest] >= 0:
+        return eos_day  # no real drop in the window; keep the NDVI-based estimate
+    return float(tv[lo + steepest + 1])
+
+
 def detect_cycles(t, y, sos_fraction, baseline_pct, peak_pct, min_amplitude,
-                   min_cycle_days, max_gap_days, smooth_window):
+                   min_cycle_days, max_gap_days, smooth_window,
+                   sar_t=None, sar_y=None, sar_gap_days=10, harvest_snap_days=20):
     """Detect all planting(SOS)->harvest(EOS) cycles in one pixel's NDVI
-    time series, robust to short noise-driven dips.
+    time series (optionally fused with Sentinel-1), robust to short
+    noise-driven dips.
 
     Unlike a single whole-record fit (compute_phenology/fit_pixel_phenology),
     this walks the (smoothed) series for every rising/falling threshold
@@ -469,6 +544,19 @@ def detect_cycles(t, y, sos_fraction, baseline_pct, peak_pct, min_amplitude,
     separate spurious 2-90 day "cycle" - exactly the failure mode observed
     feeding t.crop.yield's old single-cycle detector on real sugarcane data
     (detected durations topped out at 92 days, never approaching a year).
+
+    If sar_t/sar_y (a per-pixel SAR cross-ratio series, e.g. VH-VV dB, on
+    its own date axis) are given, Sentinel-1 is folded in two ways:
+      1. GAP-FILL: SAR dates more than sar_gap_days from any NDVI
+         observation are added to the crossing-detection series (percentile-
+         normalized onto NDVI's own baseline/amplitude scale), so cloudy
+         stretches - worst exactly when planting/early growth typically
+         happens - still contribute crossing evidence instead of a blind
+         spot.
+      2. HARVEST SNAP: each detected EOS is refined to the nearest sharp SAR
+         cross-ratio drop within harvest_snap_days (see snap_eos_to_sar) -
+         SAR's discrete structural signal usually pinpoints a ratoon cut
+         better than NDVI's gradual decline does.
 
     Returns a list of (sos_day, eos_day_or_None) tuples in chronological
     order; eos_day is None for a cycle still above threshold at the end of
@@ -490,7 +578,21 @@ def detect_cycles(t, y, sos_fraction, baseline_pct, peak_pct, min_amplitude,
         return []
     threshold = baseline + sos_fraction * amplitude
 
-    above = yv > threshold
+    tf, yf = list(tv), list(yv)
+    if sar_t is not None and sar_y is not None:
+        sar_norm = normalize_to_reference(sar_y, baseline_pct, peak_pct, baseline, amplitude)
+        for i in range(len(sar_t)):
+            if not np.isfinite(sar_norm[i]):
+                continue
+            if tv.size and np.min(np.abs(tv - sar_t[i])) <= sar_gap_days:
+                continue  # NDVI already has coverage near this date
+            tf.append(sar_t[i])
+            yf.append(sar_norm[i])
+    order = np.argsort(tf)
+    tf = np.asarray(tf)[order]
+    yf = np.asarray(yf)[order]
+
+    above = yf > threshold
 
     raw = []
     sos_idx = None
@@ -509,7 +611,7 @@ def detect_cycles(t, y, sos_fraction, baseline_pct, peak_pct, min_amplitude,
     for sos_idx, eos_idx in raw[1:]:
         prev = merged[-1]
         if prev[1] is not None:
-            gap_days = tv[sos_idx] - tv[prev[1]]
+            gap_days = tf[sos_idx] - tf[prev[1]]
             if gap_days <= max_gap_days:
                 prev[1] = eos_idx  # bridge the gap: extend the previous cycle
                 continue
@@ -517,18 +619,31 @@ def detect_cycles(t, y, sos_fraction, baseline_pct, peak_pct, min_amplitude,
 
     cycles = []
     for sos_idx, eos_idx in merged:
-        sos_day = float(tv[sos_idx])
-        eos_day = float(tv[eos_idx]) if eos_idx is not None else None
+        sos_day = float(tf[sos_idx])
+        eos_day = float(tf[eos_idx]) if eos_idx is not None else None
         if eos_day is not None and (eos_day - sos_day) < min_cycle_days:
             continue
         cycles.append((sos_day, eos_day))
+
+    if sar_t is not None and sar_y is not None and cycles:
+        cycles = [
+            (sos_day, snap_eos_to_sar(eos_day, sar_t, sar_y, harvest_snap_days) if eos_day is not None else None)
+            for sos_day, eos_day in cycles
+        ]
     return cycles
 
 
 def compute_cycles(ndvi_stack, t_days, baseline_pct, peak_pct, sos_fraction,
                     min_amplitude, min_cycle_days, max_gap_days, smooth_window,
-                    max_cycles):
+                    max_cycles, cr_stack=None, sar_days=None,
+                    sar_gap_days=10, harvest_snap_days=20):
     """Per-pixel multi-cycle detection over the whole raster stack.
+
+    cr_stack/sar_days (Sentinel-1 cross-ratio (time,row,col) stack and its
+    day-offset axis) are optional - when given, each pixel's SAR series is
+    folded into detect_cycles for cloud-gap-filling and harvest-date
+    snapping (see detect_cycles' docstring). Without them this is NDVI-only,
+    same as before Sentinel-1 fusion was added.
 
     Returns (cycle_sos, cycle_eos) as (max_cycles, rows, cols) arrays (most
     recent max_cycles cycles kept, chronological order), ncycles (rows,cols)
@@ -547,7 +662,11 @@ def compute_cycles(ndvi_stack, t_days, baseline_pct, peak_pct, sos_fraction,
     last_eos = np.full((n_rows, n_cols), np.nan)
     last_still_growing = np.zeros((n_rows, n_cols), dtype=np.int32)
 
-    gs.message("Detecting per-pixel crop cycles (multi-cycle mode) ...")
+    gs.message(
+        "Detecting per-pixel crop cycles (multi-cycle mode"
+        + (", Sentinel-1 fused)" if cr_stack is not None else ", NDVI-only - no SAR given)")
+        + " ..."
+    )
     total = n_rows * n_cols
     done = 0
     for r in range(n_rows):
@@ -558,6 +677,8 @@ def compute_cycles(ndvi_stack, t_days, baseline_pct, peak_pct, sos_fraction,
             cycles = detect_cycles(
                 t_days, ndvi_stack[:, r, c], sos_fraction, baseline_pct, peak_pct,
                 min_amplitude, min_cycle_days, max_gap_days, smooth_window,
+                sar_t=sar_days, sar_y=cr_stack[:, r, c] if cr_stack is not None else None,
+                sar_gap_days=sar_gap_days, harvest_snap_days=harvest_snap_days,
             )
             if not cycles:
                 continue
@@ -718,6 +839,8 @@ def main():
     max_gap_days = float(options["max_gap_days"])
     smooth_window = int(options["smooth_window"])
     max_cycles = int(options["max_cycles"])
+    sar_gap_days = float(options["sar_gap_days"])
+    harvest_snap_days = float(options["harvest_snap_days"])
 
     try:
         import grass.temporal as tgis
@@ -801,6 +924,15 @@ def main():
     ndvi_stack = read_stack(ndvi_maps)
     t_days = days_since(ndvi_dt, ref)
 
+    # Read the SAR stacks once, up front, so both multi-cycle detection (-m,
+    # below) and the irrigation section (further down) share one read
+    # instead of hitting disk twice for the same rasters.
+    gs.message("Reading Sentinel-1 VV/VH raster stacks ...")
+    vv_stack = read_stack([vv_by_date[d] for d in sar_dates])
+    vh_stack = read_stack([vh_by_date[d] for d in sar_dates])
+    sar_days = days_since(sar_dt, ref)
+    cr_stack = vh_stack - vv_stack
+
     sos, pos, eos, amplitude, baseline = compute_phenology(
         ndvi_stack, t_days, baseline_pct, peak_pct, sos_fraction, fast_mode
     )
@@ -829,6 +961,8 @@ def main():
         cycle_sos, cycle_eos, ncycles, last_sos, last_eos, last_still_growing = compute_cycles(
             ndvi_stack, t_days, baseline_pct, peak_pct, sos_fraction,
             min_amplitude, min_cycle_days, max_gap_days, smooth_window, max_cycles,
+            cr_stack=cr_stack, sar_days=sar_days,
+            sar_gap_days=sar_gap_days, harvest_snap_days=harvest_snap_days,
         )
         for i in range(max_cycles):
             n = i + 1
@@ -878,11 +1012,8 @@ def main():
     )
 
     # --- Irrigation -----------------------------------------------------------
+    # vv_stack/vh_stack/sar_days were already read above (shared with -m).
     gs.message("Computing Water Cloud Model soil backscatter anomaly ...")
-    vv_stack = read_stack([vv_by_date[d] for d in sar_dates])
-    vh_stack = read_stack([vh_by_date[d] for d in sar_dates])
-    sar_days = days_since(sar_dt, ref)
-
     ndvi_on_sar = interp_to(sar_days, t_days, ndvi_stack)
 
     precip_recent = None
