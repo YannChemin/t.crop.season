@@ -148,7 +148,15 @@
 # % type: double
 # % required: no
 # % answer: 45
-# % description: Below-threshold gaps shorter than this (days) are merged into the surrounding cycle instead of ending it - needed so a brief cloud-noise dip or a perennial crop's inter-ratoon canopy dip doesn't fragment one real cycle into several; raise for perennial crops (e.g. 90-120 for sugarcane)
+# % description: Below-threshold gaps shorter than this (days) are merged into the surrounding cycle instead of ending it - needed so a brief cloud-noise dip or a perennial crop's inter-ratoon canopy dip doesn't fragment one real cycle into several. Do NOT set this very large (e.g. 120) to compensate for a suspected over-fragmentation problem - a large value bridges almost any sequence of scattered short dips into one mega-cycle instead; use max_cycle_days= as the ceiling on cycle length instead
+# %end
+
+# %option
+# % key: max_cycle_days
+# % type: double
+# % required: no
+# % answer: 730
+# % description: Hard ceiling (days) on a single cycle's SOS-to-EOS span - cycles longer than this are dropped as unresolved rather than reported as a (likely inflated) single cycle. Needed because some low-contrast/noisy pixels never show one clean gap long enough for max_gap_days to split them, however tuned; default 730 (~24 months) suits most annual/perennial crops including sugarcane, raise only if a real single cycle in your crop legitimately exceeds it
 # %end
 
 # %option
@@ -529,7 +537,8 @@ def snap_eos_to_sar(eos_day, sar_t, sar_y, window_days):
 
 def detect_cycles(t, y, sos_fraction, baseline_pct, peak_pct, min_amplitude,
                    min_cycle_days, max_gap_days, smooth_window,
-                   sar_t=None, sar_y=None, sar_gap_days=10, harvest_snap_days=20):
+                   sar_t=None, sar_y=None, sar_gap_days=10, harvest_snap_days=20,
+                   max_cycle_days=None):
     """Detect all planting(SOS)->harvest(EOS) cycles in one pixel's NDVI
     time series (optionally fused with Sentinel-1), robust to short
     noise-driven dips.
@@ -644,13 +653,27 @@ def detect_cycles(t, y, sos_fraction, baseline_pct, peak_pct, min_amplitude,
             (sos_day, snap_eos_to_sar(eos_day, sar_t, sar_y, harvest_snap_days) if eos_day is not None else None)
             for sos_day, eos_day in cycles
         ]
+
+    if max_cycle_days is not None:
+        # Applied last (after SAR snapping may have shifted eos). A hard
+        # ceiling, not just a lower merge threshold: some pixels are noisy/
+        # low-contrast enough that NO max_gap_days setting cleanly splits
+        # them (their below-threshold dips are frequent but each recovers
+        # within days, so there's never one genuinely large gap to not
+        # bridge) - observed on real Madvhani data, where such a pixel kept
+        # merging into an ~800-900 day single "cycle" even at max_gap_days
+        # values that correctly split most other pixels. Rather than chase
+        # that per-pixel with ever more threshold tuning, cap what's
+        # accepted as a single valid cycle outright; longer spans are
+        # dropped as unresolved rather than reported as an inflated cycle.
+        cycles = [c for c in cycles if c[1] is None or (c[1] - c[0]) <= max_cycle_days]
     return cycles
 
 
 def compute_cycles(ndvi_stack, t_days, baseline_pct, peak_pct, sos_fraction,
                     min_amplitude, min_cycle_days, max_gap_days, smooth_window,
                     max_cycles, cr_stack=None, sar_days=None,
-                    sar_gap_days=10, harvest_snap_days=20):
+                    sar_gap_days=10, harvest_snap_days=20, max_cycle_days=None):
     """Per-pixel multi-cycle detection over the whole raster stack.
 
     cr_stack/sar_days (Sentinel-1 cross-ratio (time,row,col) stack and its
@@ -693,6 +716,7 @@ def compute_cycles(ndvi_stack, t_days, baseline_pct, peak_pct, sos_fraction,
                 min_amplitude, min_cycle_days, max_gap_days, smooth_window,
                 sar_t=sar_days, sar_y=cr_stack[:, r, c] if cr_stack is not None else None,
                 sar_gap_days=sar_gap_days, harvest_snap_days=harvest_snap_days,
+                max_cycle_days=max_cycle_days,
             )
             if not cycles:
                 continue
@@ -851,6 +875,7 @@ def main():
     min_amplitude = float(options["min_amplitude"])
     min_cycle_days = float(options["min_cycle_days"])
     max_gap_days = float(options["max_gap_days"])
+    max_cycle_days = float(options["max_cycle_days"])
     smooth_window = int(options["smooth_window"])
     max_cycles = int(options["max_cycles"])
     sar_gap_days = float(options["sar_gap_days"])
@@ -977,6 +1002,7 @@ def main():
             min_amplitude, min_cycle_days, max_gap_days, smooth_window, max_cycles,
             cr_stack=cr_stack, sar_days=sar_days,
             sar_gap_days=sar_gap_days, harvest_snap_days=harvest_snap_days,
+            max_cycle_days=max_cycle_days,
         )
         for i in range(max_cycles):
             n = i + 1
