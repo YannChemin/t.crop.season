@@ -569,16 +569,30 @@ def detect_cycles(t, y, sos_fraction, baseline_pct, peak_pct, min_amplitude,
         return []
 
     tv = t[valid]
-    yv = smooth_series(y[valid], smooth_window)
+    yv_raw = y[valid]
+    yv_smooth = smooth_series(yv_raw, smooth_window)
 
-    baseline = np.percentile(yv, baseline_pct)
-    peak = np.percentile(yv, peak_pct)
+    baseline = np.percentile(yv_smooth, baseline_pct)
+    peak = np.percentile(yv_smooth, peak_pct)
     amplitude = peak - baseline
     if amplitude < min_amplitude:
         return []
     threshold = baseline + sos_fraction * amplitude
 
-    tf, yf = list(tv), list(yv)
+    # Crossing detection runs on the RAW (unsmoothed) values, not yv_smooth:
+    # a genuine but brief harvest dip is often visible in only 1-2
+    # observations (canopy recovers fast after a ratoon cut, and cloud gaps
+    # swallow the rest of the low window) - a rolling-median filter treats
+    # that lone low reading as an outlier and erases it via majority vote,
+    # hiding a real cycle boundary (observed on real Madvhani data: a pixel
+    # with several individually-below-threshold NDVI dates read as one
+    # uninterrupted 857-day "cycle" once smoothed, inflating its yield to an
+    # implausible ~2x). smooth_window/yv_smooth is kept only to make the
+    # baseline/peak percentile estimate itself robust to single-date noise;
+    # the merge (max_gap_days) and min_cycle_days floor below still do the
+    # job of rejecting truly spurious noise-driven splits from the raw
+    # series, so this doesn't reopen the original over-fragmentation issue.
+    tf, yf = list(tv), list(yv_raw)
     if sar_t is not None and sar_y is not None:
         sar_norm = normalize_to_reference(sar_y, baseline_pct, peak_pct, baseline, amplitude)
         for i in range(len(sar_t)):
