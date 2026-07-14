@@ -127,6 +127,46 @@
 # % description: Percentile of the NDVI time series used as the season peak level
 # %end
 
+# %option
+# % key: min_amplitude
+# % type: double
+# % required: no
+# % answer: 0.1
+# % description: Minimum NDVI amplitude (peak_percentile - baseline_percentile, over the whole period) for a pixel to be considered to have any detectable crop cycle at all, used by multi-cycle detection (-m)
+# %end
+
+# %option
+# % key: min_cycle_days
+# % type: double
+# % required: no
+# % answer: 60
+# % description: Minimum SOS-to-EOS duration (days) for a detected cycle to be kept (rejects noise-driven blips); raise for perennial crops (e.g. 270 for sugarcane)
+# %end
+
+# %option
+# % key: max_gap_days
+# % type: double
+# % required: no
+# % answer: 45
+# % description: Below-threshold gaps shorter than this (days) are merged into the surrounding cycle instead of ending it - needed so a brief cloud-noise dip or a perennial crop's inter-ratoon canopy dip doesn't fragment one real cycle into several; raise for perennial crops (e.g. 90-120 for sugarcane)
+# %end
+
+# %option
+# % key: smooth_window
+# % type: integer
+# % required: no
+# % answer: 3
+# % description: Rolling-median smoothing window (in samples) applied to each pixel's NDVI series before multi-cycle threshold-crossing detection (-m); 1 disables smoothing
+# %end
+
+# %option
+# % key: max_cycles
+# % type: integer
+# % required: no
+# % answer: 5
+# % description: Maximum number of per-pixel cycles to keep/write with -m (a pixel with more detected cycles keeps only the most recent max_cycles)
+# %end
+
 # %option G_OPT_V_INPUT
 # % key: training
 # % required: no
@@ -147,6 +187,11 @@
 # %flag
 # % key: f
 # % description: Fast mode - use amplitude-threshold phenology only, skip the per-pixel double-tanh curve fit
+# %end
+
+# %flag
+# % key: m
+# % description: Multi-cycle mode - detect ALL per-pixel planting(SOS)/harvest(EOS) cycles over the period (not just one whole-record fit), with noise-merging and a minimum cycle length, suitable for annual crops with several cycles in the record AND for perennial/ratoon crops (e.g. sugarcane) with one long cycle. Writes <output>_cycleN_sos/_eos, <output>_ncycles, <output>_last_sos/_last_eos/_last_still_growing (the last-cycle triplet t.crop.yield's season_sos=/season_eos=/season_still_growing= options expect).
 # %end
 
 # %rules
@@ -391,6 +436,146 @@ def compute_phenology(ndvi_stack, t_days, baseline_pct, peak_pct, sos_fraction, 
     return sos, pos, eos, amplitude, baseline
 
 
+def smooth_series(y, window):
+    """Rolling-median smoothing over consecutive valid samples (index-based,
+    not date-gap aware - acceptable given the roughly regular cadence within
+    one sensor's STRDS). window<=1 is a no-op."""
+    import numpy as np
+
+    if window <= 1:
+        return y
+    n = len(y)
+    half = window // 2
+    out = np.empty(n)
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        out[i] = np.median(y[lo:hi])
+    return out
+
+
+def detect_cycles(t, y, sos_fraction, baseline_pct, peak_pct, min_amplitude,
+                   min_cycle_days, max_gap_days, smooth_window):
+    """Detect all planting(SOS)->harvest(EOS) cycles in one pixel's NDVI
+    time series, robust to short noise-driven dips.
+
+    Unlike a single whole-record fit (compute_phenology/fit_pixel_phenology),
+    this walks the (smoothed) series for every rising/falling threshold
+    crossing, then MERGES cycles separated by a below-threshold gap shorter
+    than max_gap_days before applying a min_cycle_days floor. That merge
+    step is what makes this usable for perennial/ratoon crops: sugarcane's
+    10-24 month cycle includes brief NDVI dips (cloud noise, partial
+    regrowth after a ratoon cut) that would otherwise each read as a
+    separate spurious 2-90 day "cycle" - exactly the failure mode observed
+    feeding t.crop.yield's old single-cycle detector on real sugarcane data
+    (detected durations topped out at 92 days, never approaching a year).
+
+    Returns a list of (sos_day, eos_day_or_None) tuples in chronological
+    order; eos_day is None for a cycle still above threshold at the end of
+    the series (still growing / not yet harvested).
+    """
+    import numpy as np
+
+    valid = np.isfinite(y)
+    if valid.sum() < 5:
+        return []
+
+    tv = t[valid]
+    yv = smooth_series(y[valid], smooth_window)
+
+    baseline = np.percentile(yv, baseline_pct)
+    peak = np.percentile(yv, peak_pct)
+    amplitude = peak - baseline
+    if amplitude < min_amplitude:
+        return []
+    threshold = baseline + sos_fraction * amplitude
+
+    above = yv > threshold
+
+    raw = []
+    sos_idx = None
+    for i in range(len(above)):
+        if above[i] and sos_idx is None:
+            sos_idx = i
+        elif not above[i] and sos_idx is not None:
+            raw.append([sos_idx, i])
+            sos_idx = None
+    if sos_idx is not None:
+        raw.append([sos_idx, None])
+    if not raw:
+        return []
+
+    merged = [raw[0]]
+    for sos_idx, eos_idx in raw[1:]:
+        prev = merged[-1]
+        if prev[1] is not None:
+            gap_days = tv[sos_idx] - tv[prev[1]]
+            if gap_days <= max_gap_days:
+                prev[1] = eos_idx  # bridge the gap: extend the previous cycle
+                continue
+        merged.append([sos_idx, eos_idx])
+
+    cycles = []
+    for sos_idx, eos_idx in merged:
+        sos_day = float(tv[sos_idx])
+        eos_day = float(tv[eos_idx]) if eos_idx is not None else None
+        if eos_day is not None and (eos_day - sos_day) < min_cycle_days:
+            continue
+        cycles.append((sos_day, eos_day))
+    return cycles
+
+
+def compute_cycles(ndvi_stack, t_days, baseline_pct, peak_pct, sos_fraction,
+                    min_amplitude, min_cycle_days, max_gap_days, smooth_window,
+                    max_cycles):
+    """Per-pixel multi-cycle detection over the whole raster stack.
+
+    Returns (cycle_sos, cycle_eos) as (max_cycles, rows, cols) arrays (most
+    recent max_cycles cycles kept, chronological order), ncycles (rows,cols)
+    int count of ALL detected cycles (may exceed max_cycles), and
+    last_sos/last_eos/last_still_growing (rows,cols) - the most recent
+    cycle, which is what t.crop.yield's season_sos=/season_eos=/
+    season_still_growing= options are meant to consume.
+    """
+    import numpy as np
+
+    n_time, n_rows, n_cols = ndvi_stack.shape
+    cycle_sos = np.full((max_cycles, n_rows, n_cols), np.nan)
+    cycle_eos = np.full((max_cycles, n_rows, n_cols), np.nan)
+    ncycles = np.zeros((n_rows, n_cols), dtype=np.int32)
+    last_sos = np.full((n_rows, n_cols), np.nan)
+    last_eos = np.full((n_rows, n_cols), np.nan)
+    last_still_growing = np.zeros((n_rows, n_cols), dtype=np.int32)
+
+    gs.message("Detecting per-pixel crop cycles (multi-cycle mode) ...")
+    total = n_rows * n_cols
+    done = 0
+    for r in range(n_rows):
+        for c in range(n_cols):
+            done += 1
+            if done % max(1, total // 20) == 0:
+                gs.percent(done, total, 5)
+            cycles = detect_cycles(
+                t_days, ndvi_stack[:, r, c], sos_fraction, baseline_pct, peak_pct,
+                min_amplitude, min_cycle_days, max_gap_days, smooth_window,
+            )
+            if not cycles:
+                continue
+            ncycles[r, c] = len(cycles)
+            for i, (sos_d, eos_d) in enumerate(cycles[-max_cycles:]):
+                cycle_sos[i, r, c] = sos_d
+                if eos_d is not None:
+                    cycle_eos[i, r, c] = eos_d
+            last_sos_d, last_eos_d = cycles[-1]
+            last_sos[r, c] = last_sos_d
+            if last_eos_d is not None:
+                last_eos[r, c] = last_eos_d
+            else:
+                last_still_growing[r, c] = 1
+    gs.percent(1, 1, 1)
+    return cycle_sos, cycle_eos, ncycles, last_sos, last_eos, last_still_growing
+
+
 def classify_stage(date_days, sos, pos, eos):
     """Vectorised per-date development-stage classification (see STAGE_LABELS)."""
     import numpy as np
@@ -527,6 +712,12 @@ def main():
     training_column = options["training_column"] or None
     do_classify = flags["c"]
     fast_mode = flags["f"]
+    multi_cycle_mode = flags["m"]
+    min_amplitude = float(options["min_amplitude"])
+    min_cycle_days = float(options["min_cycle_days"])
+    max_gap_days = float(options["max_gap_days"])
+    smooth_window = int(options["smooth_window"])
+    max_cycles = int(options["max_cycles"])
 
     try:
         import grass.temporal as tgis
@@ -563,7 +754,12 @@ def main():
     if not sar_dates:
         gs.fatal("vv/vh STRDS have no common acquisition dates.")
 
-    ref = datetime.combine(optical_dates[0], datetime.min.time())
+    # Referenced to start= (not the first actually-observed date) so that
+    # day-offsets are directly comparable with another module run against
+    # the same start= - in particular t.crop.yield's season_sos=/
+    # season_eos= consume this module's day-offset outputs and must agree
+    # on what day 0 means.
+    ref = datetime.strptime(start, "%Y-%m-%d")
 
     # --- NDVI / NDWI / CR per date -----------------------------------------
     gs.message(f"Computing NDVI/NDWI for {len(optical_dates)} date(s) ...")
@@ -627,6 +823,41 @@ def main():
         )
     gs.message(f"Phenology rasters written: {output}_sos, {output}_pos, {output}_eos, "
                f"{output}_amplitude, {output}_season_length")
+
+    # --- Multi-cycle detection (-m) ------------------------------------------
+    if multi_cycle_mode:
+        cycle_sos, cycle_eos, ncycles, last_sos, last_eos, last_still_growing = compute_cycles(
+            ndvi_stack, t_days, baseline_pct, peak_pct, sos_fraction,
+            min_amplitude, min_cycle_days, max_gap_days, smooth_window, max_cycles,
+        )
+        for i in range(max_cycles):
+            n = i + 1
+            write_raster(cycle_sos[i], f"{output}_cycle{n}_sos")
+            write_raster(cycle_eos[i], f"{output}_cycle{n}_eos")
+            for name, arr in ((f"{output}_cycle{n}_sos", cycle_sos[i]), (f"{output}_cycle{n}_eos", cycle_eos[i])):
+                gs.run_command(
+                    "r.support", map=name, title=f"t.crop.season cycle {n} " + name.rsplit("_", 1)[-1].upper(),
+                    units="days since " + ref.strftime("%Y-%m-%d"),
+                    history="t.crop.season multi-cycle output (-m)", quiet=True,
+                )
+        write_raster(ncycles.astype(np.float64), f"{output}_ncycles", categorical=True)
+        write_raster(last_sos, f"{output}_last_sos")
+        write_raster(last_eos, f"{output}_last_eos")
+        write_raster(last_still_growing.astype(np.float64), f"{output}_last_still_growing", categorical=True)
+        for name in (f"{output}_last_sos", f"{output}_last_eos"):
+            gs.run_command(
+                "r.support", map=name, title=f"t.crop.season {name.rsplit('_', 1)[-1].upper()} of last detected cycle",
+                units="days since " + ref.strftime("%Y-%m-%d"),
+                history="t.crop.season multi-cycle output (-m)", quiet=True,
+            )
+        gs.write_command(
+            "r.category", map=f"{output}_last_still_growing", separator="pipe", rules="-",
+            stdin="0|harvested (EOS observed)\n1|still growing (no EOS in period)\n", quiet=True,
+        )
+        gs.message(
+            f"Multi-cycle outputs written: {output}_cycle1..{max_cycles}_sos/_eos, {output}_ncycles, "
+            f"{output}_last_sos, {output}_last_eos, {output}_last_still_growing"
+        )
 
     # --- Per-date development-stage classification --------------------------
     gs.message("Classifying development stage per date ...")
